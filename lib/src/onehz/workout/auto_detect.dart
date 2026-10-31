@@ -89,6 +89,19 @@ class AutoWorkoutDetector {
   /// you work out?" prompt should ask about.
   static const double hrrFloorFraction = 0.45;
 
+  /// Lower %HRR gate used only to place the boundaries around an already
+  /// qualified high-intensity core. Detection still requires
+  /// [hrrFloorFraction]; this recovers a contiguous warm-up/cool-down instead
+  /// of reporting only the minutes that cleared the high detection gate.
+  static const double boundaryHrrFraction = 0.30;
+
+  /// Boundary floor above resting HR. This is never a detection threshold.
+  static const int boundaryMarginBpm = 20;
+
+  /// A boundary may expand at most this far on either side of the qualified
+  /// core. This prevents an otherwise-active day from being absorbed into it.
+  static const int maxBoundaryExtensionS = 10 * 60;
+
   /// HRmax fallback when the caller passes none (age-predicted is preferred).
   static const int defaultMaxHR = 190;
 
@@ -214,6 +227,9 @@ class AutoWorkoutDetector {
     final hrMax = maxBpm ?? defaultMaxHR;
     final hrrFloor = (rhr + hrrFloorFraction * (hrMax - rhr)).round();
     final floor = math.max(rhr + elevatedMarginBPM, hrrFloor);
+    final boundaryHrrFloor =
+        (rhr + boundaryHrrFraction * (hrMax - rhr)).round();
+    final boundaryFloor = math.max(rhr + boundaryMarginBpm, boundaryHrrFloor);
 
     // --- 1+2+3: grow sustained spans tolerating brief dips ---
     final spans = <List<int>>[]; // [start, end]
@@ -232,7 +248,8 @@ class AutoWorkoutDetector {
 
     for (var k = 0; k < n; k++) {
       // Break on a hole in the record before anything else — see [maxGapS].
-      if (k > 0 && spanStart != null && ts[k] - ts[k - 1] > maxGapS) closeSpan();
+      if (k > 0 && spanStart != null && ts[k] - ts[k - 1] > maxGapS)
+        closeSpan();
       if (bpm[k] >= floor) {
         spanStart ??= ts[k];
         spanEnd = ts[k];
@@ -263,34 +280,29 @@ class AutoWorkoutDetector {
     merged.add([curStart, curEnd]);
 
     // --- 5+6+7 ---
-    final motionSeries =
-        (motion == null || motion.isEmpty) ? null : motion;
+    final motionSeries = (motion == null || motion.isEmpty) ? null : motion;
     final results = <DetectedWorkout>[];
     for (final span in merged) {
-      final start = span[0], end = span[1];
+      final coreStart = span[0], coreEnd = span[1];
 
       // A workout is time-bounded — a multi-hour sustained elevation is lifestyle
       // activity, not a workout to suggest.
-      if ((end - start) > maxWorkoutMin * 60) continue;
+      if ((coreEnd - coreStart) > maxWorkoutMin * 60) continue;
 
-      // 6: never re-suggest a window overlapping a saved workout.
-      if (savedSpans.any((s) => _overlaps(start, end, s.startSec, s.endSec))) {
-        continue;
-      }
-
-      // window HR samples
-      final winBpm = <int>[];
+      // Core HR samples. The high gate qualifies the bout; a lower gate is
+      // allowed to place its edges only after every qualification check passes.
+      final coreBpm = <int>[];
       for (var k = 0; k < n; k++) {
-        if (ts[k] >= start && ts[k] <= end) winBpm.add(bpm[k]);
+        if (ts[k] >= coreStart && ts[k] <= coreEnd) coreBpm.add(bpm[k]);
       }
-      if (winBpm.isEmpty) continue;
+      if (coreBpm.isEmpty) continue;
 
       // The WHOLE window must be genuinely elevated, not just brief floor
       // crossings that dip-bridging stitched together — require the mean HR to
       // clear the floor too. (A sedentary afternoon oscillating around the gate
       // averaged below it; a real bout averages well above.)
-      final winMean = winBpm.reduce((a, b) => a + b) / winBpm.length;
-      if (winMean < floor) continue;
+      final coreMean = coreBpm.reduce((a, b) => a + b) / coreBpm.length;
+      if (coreMean < floor) continue;
 
       // 5: motion confirmation when a continuous motion series was supplied.
       double? meanMotion;
@@ -298,7 +310,7 @@ class AutoWorkoutDetector {
         var sum = 0.0;
         var cnt = 0;
         for (final p in motionSeries) {
-          if (p.ts >= start && p.ts <= end) {
+          if (p.ts >= coreStart && p.ts <= coreEnd) {
             sum += p.intensity;
             cnt++;
           }
@@ -307,9 +319,9 @@ class AutoWorkoutDetector {
         if (meanMotion < motionConfirmMean) {
           // Low-motion but a genuine exercise-like onset — see [onsetRiseBpm].
           final preMean =
-              _meanBpmInRange(ts, bpm, start - onsetLookbackS, start);
-          final earlyMean = _meanBpmInRange(
-              ts, bpm, start, math.min(end + 1, start + onsetWindowS));
+              _meanBpmInRange(ts, bpm, coreStart - onsetLookbackS, coreStart);
+          final earlyMean = _meanBpmInRange(ts, bpm, coreStart,
+              math.min(coreEnd + 1, coreStart + onsetWindowS));
           if (preMean == null ||
               earlyMean == null ||
               (earlyMean - preMean) < onsetRiseBpm) {
@@ -317,6 +329,29 @@ class AutoWorkoutDetector {
           }
         }
       }
+
+      final bounds = _refineBoundaries(
+        ts,
+        bpm,
+        coreStart,
+        coreEnd,
+        boundaryFloor,
+      );
+      final start = bounds.$1, end = bounds.$2;
+      if ((end - start) > maxWorkoutMin * 60) continue;
+
+      // Never re-suggest a window overlapping a saved workout. Compare the
+      // final window, not only its high-HR core: a saved warm-up is still the
+      // same workout.
+      if (savedSpans.any((s) => _overlaps(start, end, s.startSec, s.endSec))) {
+        continue;
+      }
+
+      final winBpm = <int>[];
+      for (var k = 0; k < n; k++) {
+        if (ts[k] >= start && ts[k] <= end) winBpm.add(bpm[k]);
+      }
+      if (winBpm.isEmpty) continue;
 
       var sum = 0;
       var peak = winBpm.first;
@@ -335,9 +370,8 @@ class AutoWorkoutDetector {
         peakBpm: peak.toDouble(),
         durationS: (end - start).toDouble(),
       );
-      final feats = meanMotion == null
-          ? null
-          : MotionFeatures(meanIntensity: meanMotion);
+      final feats =
+          meanMotion == null ? null : MotionFeatures(meanIntensity: meanMotion);
       final sport = classify(bout, feats);
 
       results.add(DetectedWorkout(
@@ -352,14 +386,83 @@ class AutoWorkoutDetector {
     return results;
   }
 
+  /// Expand an already-qualified core through contiguous lower-intensity
+  /// warm-up/cool-down HR. Real timestamp gaps and sustained recovery stop the
+  /// expansion; short dips use the same tolerance as core detection.
+  static (int, int) _refineBoundaries(
+    List<int> ts,
+    List<int> bpm,
+    int coreStart,
+    int coreEnd,
+    int boundaryFloor,
+  ) {
+    final first = _lowerBound(ts, coreStart);
+    final afterLast = _upperBound(ts, coreEnd);
+    if (first >= ts.length || afterLast <= 0) return (coreStart, coreEnd);
+
+    var start = coreStart;
+    int? lowEnd;
+    for (var k = first - 1; k >= 0; k--) {
+      if (coreStart - ts[k] > maxBoundaryExtensionS) break;
+      if (ts[k + 1] - ts[k] > maxGapS) break;
+      if (bpm[k] >= boundaryFloor) {
+        start = ts[k];
+        lowEnd = null;
+      } else {
+        lowEnd ??= ts[k + 1];
+        if (lowEnd - ts[k] > maxDipS) break;
+      }
+    }
+
+    var end = coreEnd;
+    int? lowStart;
+    for (var k = afterLast; k < ts.length; k++) {
+      if (ts[k] - coreEnd > maxBoundaryExtensionS) break;
+      if (ts[k] - ts[k - 1] > maxGapS) break;
+      if (bpm[k] >= boundaryFloor) {
+        end = ts[k];
+        lowStart = null;
+      } else {
+        lowStart ??= ts[k - 1];
+        if (ts[k] - lowStart > maxDipS) break;
+      }
+    }
+    return (start, end);
+  }
+
+  static int _lowerBound(List<int> xs, int value) {
+    var lo = 0, hi = xs.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (xs[mid] < value) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  static int _upperBound(List<int> xs, int value) {
+    var lo = 0, hi = xs.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (xs[mid] <= value) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
   /// Closed-interval overlap (touching endpoints count).
   static bool _overlaps(int aStart, int aEnd, int bStart, int bEnd) =>
       aStart <= bEnd && bStart <= aEnd;
 
   /// Mean bpm for samples with `lo <= ts < hi`. Null when nothing falls in
   /// range (can't evaluate — caller must abstain, not substitute a default).
-  static double? _meanBpmInRange(
-      List<int> ts, List<int> bpm, int lo, int hi) {
+  static double? _meanBpmInRange(List<int> ts, List<int> bpm, int lo, int hi) {
     var sum = 0, cnt = 0;
     for (var k = 0; k < ts.length; k++) {
       if (ts[k] >= lo && ts[k] < hi) {
