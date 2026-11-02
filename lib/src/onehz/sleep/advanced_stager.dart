@@ -205,6 +205,8 @@ class AdvancedSleepStager {
   static const int daytimeBandStartHour = 11;
   static const int daytimeBandEndHour = 20;
   static const int nightContinuationGapMin = 90;
+  static const int nightHeadBridgeGapMin = 60;
+  static const int nightHeadMinMin = 30;
   static const int daytimeMinSleepMin = 90;
   static const double daytimeRestingHRMult = 0.95;
 
@@ -351,7 +353,33 @@ class AdvancedSleepStager {
     var nightTailAccepted = false;
     final sessions = <SleepSession>[];
 
-    for (final p in runs) {
+    bool hasQualifyingNightContinuation(int index, _Period head) {
+      if (!_isOvernightOnset(head.start, tzAt) ||
+          (head.end - head.start) < nightHeadMinMin * 60) {
+        return false;
+      }
+      for (var j = index + 1; j < runs.length; j++) {
+        final next = runs[j];
+        if (next.stage != 'sleep') continue;
+        final gap = next.start - head.end;
+        if (gap < 0) continue;
+        if (gap >= nightHeadBridgeGapMin * 60) return false;
+        if ((next.end - next.start) <= minSleepS ||
+            (next.end - head.start) > maxMainSleepSpanS) {
+          return false;
+        }
+        if (!_confirmSleepWithHR(next, hrS, baseline) ||
+            _offWristFraction(next, hrS, wristOff) >=
+                maxOffWristSleepFraction) {
+          return false;
+        }
+        return true;
+      }
+      return false;
+    }
+
+    for (var runIndex = 0; runIndex < runs.length; runIndex++) {
+      final p = runs[runIndex];
       if (p.stage != 'sleep') continue;
       // Chain state must be known BEFORE the min-session floor: a night-tail
       // re-onset (still, HR-in-band, within nightContinuationGapMin of the main
@@ -364,11 +392,24 @@ class AdvancedSleepStager {
           : false;
       final isNightTail =
           continuesChain && chainFromOvernight && !nightTailAccepted;
+      // The continuation rule used to work only forwards: a short fragment
+      // AFTER a qualifying overnight block survived, while the same fragment
+      // BEFORE that block was discarded before the detector could see what
+      // followed. A real night then began at 03:15, briefly woke, resumed at
+      // 05:06, and was published as "nap + main sleep" with a 05:06 onset.
+      // Keep a substantial low-HR overnight head only when a qualifying main
+      // block follows within the same <60-minute bridge used by segmentSleep.
+      // Both fragments still pass the ordinary HR/off-wrist gates below.
+      final isNightHead = !continuesChain &&
+          (p.end - p.start) <= minSleepS &&
+          hasQualifyingNightContinuation(runIndex, p);
       // Min-session floor: standalone runs still need > 60 min (so daytime naps
       // and stray still-blocks stay excluded); ONLY the first SHORT night-tail
       // per chain is exempt (nightTailAccepted bounds it). The other gates below
       // (max-span, HR-confirm, off-wrist) still apply to night-tails.
-      if ((p.end - p.start) <= minSleepS && !isNightTail) continue;
+      if ((p.end - p.start) <= minSleepS && !isNightTail && !isNightHead) {
+        continue;
+      }
       if ((p.end - p.start) > maxMainSleepSpanS) continue; // #547 drop
       if (!_confirmSleepWithHR(p, hrS, baseline)) continue;
       if (_offWristFraction(p, hrS, wristOff) >= maxOffWristSleepFraction) {

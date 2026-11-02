@@ -44,6 +44,7 @@ import '../util.dart';
 import 'van_hees.dart';
 import 'accounting.dart' show SleepStage;
 import 'advanced_stager.dart';
+import 'nap.dart' show SleepWindowSpan, detectNaps;
 
 /// Minimum in-bed duration to qualify as the main sleep (ARCHITECTURE_V2: ~3 h).
 const int _minQualifyingSleepSec = 3 * 3600;
@@ -476,7 +477,7 @@ SleepSegmentation segmentSleep(
         RrTs((rrTsMs[i] / 1000.0).round(), rrMs[i])
   ];
 
-  final _SleepGroup? chosen;
+  _SleepGroup? chosen;
   if (forcedWindow != null) {
     final onsetSec = forcedWindow.onsetSec;
     final offsetSec = forcedWindow.offsetSec;
@@ -504,6 +505,68 @@ SleepSegmentation segmentSleep(
       tzAt,
       habitualMidsleepSec: habitualMidsleepSec,
     );
+
+    // The nocturnal detector deliberately uses a stricter HR gate than the
+    // nap detector. On a real fragmented night that rejected the first
+    // low-motion/low-daytime-HR block, then the nap pass labelled it as a nap:
+    // 03:15 sleep, a prolonged awakening, and 05:06 resumed sleep published as
+    // "nap + main" with a 05:06 onset. Reconcile only a high-confidence block
+    // immediately BEFORE the chosen overnight main sleep. Re-stage the combined
+    // window through the canonical stager so the gap becomes measured WASO and
+    // the later nap pass excludes the block instead of double-counting it.
+    if (chosen case final main?) {
+      final ts = [for (final a in trimmedAccel) a.tsMs ~/ 1000];
+      final mainLo = _lowerBoundInt(ts, main.start);
+      final mainHi = _lowerBoundInt(ts, main.end);
+      final candidates = detectNaps(
+        trimmedAccel,
+        trimmedHr,
+        mainSleep: mainHi > mainLo ? SleepWindowSpan(mainLo, mainHi) : null,
+      ).value;
+      if (candidates != null && candidates.isNotEmpty) {
+        final baseSec = ts.first;
+        int localHour(int epochSec) =>
+            (((epochSec + tzAt(epochSec)) % 86400) + 86400) % 86400 ~/ 3600;
+        bool overnight(int epochSec) {
+          final h = localHour(epochSec);
+          return h >= 20 || h < 11;
+        }
+
+        final eligible = [
+          for (final n in candidates)
+            (
+              start: baseSec + n.startSec,
+              end: baseSec + n.endSec,
+              confidence: n.confidence,
+            ),
+        ].where((n) {
+          final gap = main.start - n.end;
+          return n.confidence >= 0.6 &&
+              overnight(n.start) &&
+              gap >= 0 &&
+              gap < 60 * 60 &&
+              main.end - n.start <= 16 * 60 * 60;
+        }).toList()
+          ..sort((a, b) => b.end.compareTo(a.end));
+        if (eligible.isNotEmpty) {
+          final start = eligible.first.start;
+          final session = AdvancedSleepStager.stageWindow(
+            start,
+            main.end,
+            grav,
+            hr,
+            rr: rr,
+          );
+          chosen = _SleepGroup(
+            sessions: [session],
+            start: start,
+            end: main.end,
+            asleepMin:
+                AdvancedSleepStager.hypnogramMetrics(session).tstS / 60.0,
+          );
+        }
+      }
+    }
   }
   if (chosen == null) return SleepSegmentation.absent;
 

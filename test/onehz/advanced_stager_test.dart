@@ -91,6 +91,115 @@ void main() {
       expect(sessions, isEmpty);
     });
 
+    test('short overnight head is retained when main sleep resumes within 60m',
+        () {
+      final grav = <GravTs>[];
+      final hr = <HrTs>[];
+      var t = 0;
+
+      void block(int seconds, {required bool still, required double bpm}) {
+        for (var i = 0; i < seconds; i++) {
+          final wave = still ? 0.001 * math.sin(i * 0.01) : 0.3 * math.sin(i);
+          grav.add(GravTs(t, wave, still ? 0.001 : 0.3, still ? 1.0 : 0.8));
+          hr.add(HrTs(t, bpm + math.sin(i / 120.0)));
+          t++;
+        }
+      }
+
+      block(3 * 3600, still: false, bpm: 75);
+      final firstOnset = t;
+      block(45 * 60, still: true, bpm: 58);
+      block(45 * 60, still: false, bpm: 72);
+      final resumed = t;
+      block(6 * 3600, still: true, bpm: 59);
+      block(3600, still: false, bpm: 75);
+
+      final sessions = AdvancedSleepStager.detectSleep(
+        grav,
+        hr,
+        tzOffsetSec: 0,
+      );
+      expect(sessions, hasLength(2));
+      expect(sessions.first.start, closeTo(firstOnset, 15 * 60));
+      expect(sessions.last.start, closeTo(resumed, 15 * 60));
+
+      final segmented = segmentSleep(
+        [
+          for (final g in grav)
+            AccelSample(g.ts * 1000.0, g.x, g.y, g.z, valid: g.valid),
+        ],
+        [for (final h in hr) h.bpm],
+        tzOffsetSec: 0,
+      );
+      expect(segmented.window, isNotNull);
+      expect(
+        segmented.window!.onsetMs! / 1000,
+        closeTo(firstOnset, 15 * 60),
+        reason: 'the first overnight fragment is part of main sleep onset',
+      );
+    });
+
+    test('isolated short overnight stillness remains rejected', () {
+      final d = build(3, 0, 1);
+      final grav = [...d.grav];
+      final hr = [...d.hr];
+      var t = grav.length;
+      for (var i = 0; i < 45 * 60; i++) {
+        grav.add(GravTs(t, 0.001 * math.sin(i * 0.01), 0.001, 1.0));
+        hr.add(HrTs(t, 58));
+        t++;
+      }
+      expect(AdvancedSleepStager.detectSleep(grav, hr), isEmpty);
+    });
+
+    test('nap-quality overnight head extends main onset when HR gate rejects it',
+        () {
+      final accel = <AccelSample>[];
+      final hr = <double>[];
+      var t = 0;
+      void block(int seconds, {required bool still, required double bpm}) {
+        for (var i = 0; i < seconds; i++) {
+          final x = still ? 0.001 * math.sin(i * 0.01) : (i.isEven ? 0.0 : 1.0);
+          final z = still ? 1.0 : (i.isEven ? 1.0 : 0.0);
+          accel.add(AccelSample(
+            t * 1000.0,
+            x,
+            still ? 0.001 : 0.0,
+            z,
+          ));
+          hr.add(bpm + math.sin(i / 120.0));
+          t++;
+        }
+      }
+
+      block(3 * 3600, still: false, bpm: 75);
+      final firstOnset = t;
+      block(45 * 60, still: true, bpm: 65);
+      block(45 * 60, still: false, bpm: 75);
+      block(6 * 3600, still: true, bpm: 59);
+      block(3600, still: false, bpm: 75);
+
+      final grav = [
+        for (final a in accel)
+          GravTs(a.tsMs ~/ 1000, a.x, a.y, a.z, valid: a.valid),
+      ];
+      final hrs = [for (var i = 0; i < hr.length; i++) HrTs(i, hr[i])];
+      final detected =
+          AdvancedSleepStager.detectSleep(grav, hrs, tzOffsetSec: 0);
+      expect(
+        detected,
+        hasLength(1),
+        reason: 'the stricter nocturnal HR gate rejects the early block',
+      );
+
+      final segmented = segmentSleep(accel, hr, tzOffsetSec: 0);
+      expect(segmented.window, isNotNull);
+      expect(
+        segmented.window!.onsetMs! / 1000,
+        closeTo(firstOnset, 15 * 60),
+      );
+    });
+
     test('16h cap (#547) drops an over-long still span entirely', () {
       final d = build(1, 17, 1); // 17h still > 16h cap
       final sessions = AdvancedSleepStager.detectSleep(d.grav, d.hr, rr: d.rr);
