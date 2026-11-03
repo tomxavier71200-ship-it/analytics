@@ -1,7 +1,7 @@
 // auto_detect.dart — opt-in "did you just work out?" SUGGESTION detector.
 //
 // Opt-in workout suggestion detector (ported from AutoWorkoutDetector.swift).
-// DELIBERATELY conservative (low sensitivity): a sustained ≥12-min elevation of
+// DELIBERATELY conservative (low sensitivity): a sustained ≥10-min elevation of
 // HR ≥ max(RHR+[elevatedMarginBPM], RHR+[hrrFloorFraction]·HRR) — RHR+59 at
 // RHR 60 / HRmax 190 — brief (≤90 s) dips tolerated, near windows merged,
 // optional motion confirmation, overlap-excluded against saved spans.
@@ -111,8 +111,8 @@ class AutoWorkoutDetector {
   /// are better logged manually than auto-prompted.
   static const int maxWorkoutMin = 120;
 
-  /// A candidate must hold the gate for a contiguous span ≥ this (12 min).
-  static const double minSustainedMin = 12.0;
+  /// A candidate must hold the gate for a contiguous span ≥ this (10 min).
+  static const double minSustainedMin = 10.0;
 
   /// A dip below the gate no longer than this does NOT break the span.
   static const int maxDipS = 90;
@@ -140,10 +140,10 @@ class AutoWorkoutDetector {
 
   /// Lookback immediately before a span's start, used to test for an
   /// exercise-like HR ONSET as a motion-gate bypass — see [onsetRiseBpm].
-  static const int onsetLookbackS = 180;
+  static const int onsetLookbackS = 60;
 
   /// The onset check's "post" window: the first stretch of the span itself.
-  static const int onsetWindowS = 180;
+  static const int onsetWindowS = 60;
 
   /// Bypass the motion-confirmation gate when it fails BUT the HR shows a
   /// genuine exercise ONSET: mean bpm over [onsetWindowS] at the START of the
@@ -162,7 +162,7 @@ class AutoWorkoutDetector {
   /// pre-window (nothing in [onsetLookbackS], e.g. the day/recording starts
   /// mid-span) → the onset can't be evaluated → abstain, motion gate stays in
   /// force (never fabricate an onset that isn't there).
-  static const double onsetRiseBpm = 25.0;
+  static const double onsetRiseBpm = 12.0;
 
   /// Resting-HR fallback when the caller has no nightly RHR.
   static const int defaultRestingHR = 60;
@@ -238,10 +238,7 @@ class AutoWorkoutDetector {
     int? dipStart;
 
     void closeSpan() {
-      if (spanStart != null &&
-          (spanEnd - spanStart!).toDouble() >= minSustainedMin * 60.0) {
-        spans.add([spanStart!, spanEnd]);
-      }
+      if (spanStart != null) spans.add([spanStart!, spanEnd]);
       spanStart = null;
       dipStart = null;
     }
@@ -284,6 +281,12 @@ class AutoWorkoutDetector {
     final results = <DetectedWorkout>[];
     for (final span in merged) {
       final coreStart = span[0], coreEnd = span[1];
+
+      // Apply the minimum to the merged elevated window, not each fragment.
+      // Otherwise a real short workout with a two-minute HR dip becomes two
+      // discarded sub-threshold fragments even though its full elevated
+      // window and mean HR meet the same conservative gates below.
+      if ((coreEnd - coreStart).toDouble() < minSustainedMin * 60.0) continue;
 
       // A workout is time-bounded — a multi-hour sustained elevation is lifestyle
       // activity, not a workout to suggest.
@@ -501,7 +504,7 @@ Metric<List<DetectedWorkout>> autoDetectWorkouts({
     inputs_used: const ['hr_1hz', 'resting_hr', 'motion_1hz'],
     note: 'opt-in workout suggestion (HR ≥ max(RHR+'
         '${AutoWorkoutDetector.elevatedMarginBPM}, RHR+'
-        '${AutoWorkoutDetector.hrrFloorFraction}·HRR) sustained ≥12 min); '
+        '${AutoWorkoutDetector.hrrFloorFraction}·HRR) sustained ≥10 min); '
         'wrist-HR ESTIMATE, not medical advice',
   );
 }
