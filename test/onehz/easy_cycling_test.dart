@@ -40,4 +40,24 @@ void main() {
     expect(run(recording(gap: true)), isEmpty);
     expect(run(recording(rideSteps: 90)), isEmpty);
   });
+
+  test('ten minutes is a minimum and a longer ride keeps its full window', () {
+    final values = recording();
+    final longer = [
+      ...values.take(14),
+      for (var i = 14; i < 22; i++)
+        (startSec: i * 60, bpm: 112.0, peak: 116, steps: 8, motion: .08),
+      for (final m in values.skip(14))
+        (
+          startSec: m.startSec + 8 * 60,
+          bpm: m.bpm,
+          peak: m.peak,
+          steps: m.steps,
+          motion: m.motion
+        ),
+    ];
+    final ride = run(longer).single;
+    expect((ride.startSec, ride.endSec), (4 * 60, 22 * 60));
+    expect(ride.durationMin, 18);
+  });
 }

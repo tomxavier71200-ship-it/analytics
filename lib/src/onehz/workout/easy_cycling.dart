@@ -51,12 +51,7 @@ List<DetectedWorkout> suggestEasyCycling(
         window.where((m) => m.bpm >= floor).length < 7) {
       continue;
     }
-    final avg = mean(window);
-    if (avg < floor ||
-        !around(start - 5 * 60, 5).any(gait) ||
-        !around(end, 5).any(gait)) {
-      continue;
-    }
+    if (mean(window) < floor) continue;
     final before = around(start - 3 * 60, 3);
     if (before.length < 2) continue;
     final preMean = mean(before);
@@ -67,15 +62,34 @@ List<DetectedWorkout> suggestEasyCycling(
         .every((bpm) => bpm - preMean < AutoWorkoutDetector.onsetRiseBpm)) {
       continue;
     }
+    var first = start, last = end;
+    bool continued(CyclingMinute? minute) =>
+        minute != null && !gait(minute) && minute.bpm >= floor;
+    while (continued(byTime[first - 60]) &&
+        last - first < AutoWorkoutDetector.maxWorkoutMin * 60) {
+      first -= 60;
+    }
+    while (continued(byTime[last]) &&
+        last - first < AutoWorkoutDetector.maxWorkoutMin * 60) {
+      last += 60;
+    }
+    while (first < last && !lowSteps(byTime[first]!)) first += 60;
+    while (last > first && !lowSteps(byTime[last - 60]!)) last -= 60;
+    if (last - first < minutes * 60 ||
+        !around(first - 5 * 60, 5).any(gait) ||
+        !around(last, 5).any(gait)) {
+      continue;
+    }
+    final ride = around(first, (last - first) ~/ 60);
     final candidate = DetectedWorkout(
-      startSec: start,
-      endSec: end,
-      avgBpm: avg.round(),
-      peakBpm: window.map((m) => m.peak).reduce(math.max),
-      durationMin: minutes,
+      startSec: first,
+      endSec: last,
+      avgBpm: mean(ride).round(),
+      peakBpm: ride.map((m) => m.peak).reduce(math.max),
+      durationMin: (last - first) ~/ 60,
       sport: 'cycling',
     );
-    if (candidates.isNotEmpty && candidates.last.endSec > start) {
+    if (candidates.isNotEmpty && candidates.last.endSec > first) {
       if (candidate.avgBpm > candidates.last.avgBpm) {
         candidates[candidates.length - 1] = candidate;
       }
