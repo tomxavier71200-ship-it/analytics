@@ -582,6 +582,28 @@ SleepSegmentation segmentSleep(
     return SleepSegmentation.absent;
   }
 
+  if (chosen.sessions.length > 1) {
+    // Detection chooses the night's boundaries; it does not classify every
+    // intervening second. Leaving the gaps between detected fragments unwritten
+    // below turns them into assumed wake, even with usable HR and accelerometry.
+    // Stage the whole selected night with the same canonical path used by a
+    // confirmed window. Real arousals can remain wake; the observed mask below
+    // still excludes missing samples instead of inventing sleep across them.
+    final session = AdvancedSleepStager.stageWindow(
+      chosen.start,
+      chosen.end,
+      grav,
+      hr,
+      rr: rr,
+    );
+    chosen = _SleepGroup(
+      sessions: [session],
+      start: chosen.start,
+      end: chosen.end,
+      asleepMin: AdvancedSleepStager.hypnogramMetrics(session).tstS / 60.0,
+    );
+  }
+
   // OBSERVED mask over the wall-clock window. `inBed` is wall-clock length but
   // `trimmedAccel` is a POSITIONAL array with holes (pruning, sync gaps), and HR
   // is intermittent — so a second is observed only when BOTH hold:
