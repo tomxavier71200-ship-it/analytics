@@ -501,7 +501,12 @@ SleepSegmentation segmentSleep(
     if (sessions.isEmpty) return SleepSegmentation.absent;
 
     chosen = _pickMainSleepGroup(
-      _bridgeAdjacentSessions(sessions),
+      _bridgeAdjacentSessions(
+        sessions,
+        canBridgeLongGap: (previous, next) => _withinObservedSleepOpportunity(
+          previous, next, fallbackWindow, grav, hr, tzAt,
+        ),
+      ),
       tzAt,
       habitualMidsleepSec: habitualMidsleepSec,
     );
@@ -825,7 +830,78 @@ class _SleepGroup {
   });
 }
 
-List<_SleepGroup> _bridgeAdjacentSessions(List<SleepSession> sessions) {
+/// The gravity-delta detector can reject a restless stretch that the independent
+/// sustained arm-angle rule still places inside ONE sleep opportunity. A fixed
+/// one-hour session gap then discards a genuine later overnight block entirely.
+/// Reconcile only two already-qualified overnight sessions: the angle window
+/// must cover their gap, paired HR/gravity must be observed, and HR must remain
+/// in the flanking sleep band's ordinary confirmation range. This changes the
+/// grouping, never credits the gap as sleep; canonical whole-window staging and
+/// the observed mask below still decide every second (including real WASO).
+bool _withinObservedSleepOpportunity(
+  _SleepGroup previous,
+  SleepSession next,
+  SleepWindow? opportunity,
+  List<GravTs> gravity,
+  List<HrTs> hr,
+  int Function(int) tzAt,
+) {
+  if (opportunity?.onsetMs == null ||
+      opportunity?.offsetMs == null ||
+      next.end - previous.start > AdvancedSleepStager.maxMainSleepSpanS ||
+      opportunity!.onsetMs! > previous.end * 1000 ||
+      opportunity.offsetMs! < next.start * 1000) {
+    return false;
+  }
+  int hour(int ts) => (((ts + tzAt(ts)) % 86400) + 86400) % 86400 ~/ 3600;
+  final firstHour = hour(previous.start);
+  if ((firstHour >= AdvancedSleepStager.daytimeBandStartHour &&
+          firstHour < AdvancedSleepStager.daytimeBandEndHour) ||
+      hour(next.start) >= AdvancedSleepStager.daytimeBandStartHour) {
+    return false;
+  }
+  final start = previous.end;
+  final end = next.start;
+  final duration = end - start;
+  if (duration <= 0) return false;
+  final cardiac = <int, double>{
+    for (final h in hr)
+      if (h.ts >= start && h.ts < end && h.bpm.isFinite && h.bpm > 0)
+        h.ts: h.bpm,
+  };
+  final paired = <int>{
+    for (final g in gravity)
+      if (g.ts >= start && g.ts < end && g.valid && cardiac.containsKey(g.ts))
+        g.ts,
+  }.toList()
+    ..sort();
+  if (paired.length / duration < kMinObservedFractionForSleep) return false;
+  // Do not turn a long unobserved interruption into an inferred continuation.
+  const maxGap = AdvancedSleepStager.maxGapMin * 60;
+  var last = start;
+  for (final ts in paired) {
+    if (ts - last > maxGap) return false;
+    last = ts;
+  }
+  if (end - last > maxGap) return false;
+  final flankingHr = [
+    for (final h in hr)
+      if ((h.ts >= previous.sessions.last.start && h.ts <= previous.end) ||
+          (h.ts >= next.start && h.ts <= next.end))
+        if (h.bpm.isFinite && h.bpm > 0) h.bpm,
+  ];
+  if (flankingHr.length < AdvancedSleepStager.hrRefineMinSamples) return false;
+  final baseline = median(flankingHr);
+  if (baseline == null) return false;
+  final meanGapHr =
+      paired.fold<double>(0, (sum, ts) => sum + cardiac[ts]!) / paired.length;
+  return meanGapHr <= baseline * AdvancedSleepStager.hrSleepBaselineMult;
+}
+
+List<_SleepGroup> _bridgeAdjacentSessions(
+  List<SleepSession> sessions, {
+  bool Function(_SleepGroup previous, SleepSession next)? canBridgeLongGap,
+}) {
   if (sessions.isEmpty) return const [];
   final sorted = [...sessions]..sort((a, b) => a.start.compareTo(b.start));
   const bridgeGapSec = 60 * 60;
@@ -845,7 +921,9 @@ List<_SleepGroup> _bridgeAdjacentSessions(List<SleepSession> sessions) {
     }
     final last = out.removeLast();
     final gap = session.start - last.end;
-    if (gap >= 0 && gap < bridgeGapSec) {
+    if (gap >= 0 &&
+        (gap < bridgeGapSec ||
+            (canBridgeLongGap?.call(last, session) ?? false))) {
       out.add(
         _SleepGroup(
           sessions: [...last.sessions, session],
