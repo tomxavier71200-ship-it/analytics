@@ -11,6 +11,7 @@ import 'package:test/test.dart';
   double gapHr = 62,
   int startHour = 22,
   int sleepEndHour = 11,
+  double Function(int second)? gapHrAt,
 }) {
   final base = DateTime.utc(2026, 1, 10, startHour - 1).millisecondsSinceEpoch;
   final accel = <AccelSample>[];
@@ -22,7 +23,9 @@ import 'package:test/test.dart';
     final z = active ? (s.isEven ? 1.0 : 0.5) : 1.0;
     accel.add(
         AccelSample(base + s * 1000.0, x, 0, z, valid: !(gap && gapMissing)));
-    hr.add(active ? 95 : (gap ? (gapCardiacMissing ? 0 : gapHr) : 60));
+    hr.add(active
+        ? 95
+        : (gap ? (gapCardiacMissing ? 0 : (gapHrAt?.call(s) ?? gapHr)) : 60));
   }
   return (accel: accel, hr: hr);
 }
@@ -63,6 +66,21 @@ void main() {
 
   test('sustained activity separates the two sleep periods', () {
     expect(wakeHour(run(active: true)), closeTo(3, 0.25));
+  });
+
+  test(
+      'transient HR elevations do not discard a supported overnight continuation',
+      () {
+    final data = recording(gapHrAt: (s) => s % 60 < 10 ? 90 : 60);
+    final result = segmentSleep(data.accel, data.hr, tzOffsetSec: 0);
+    expect(result.present, isTrue);
+    expect(wakeHour(result), closeTo(8, 0.25));
+  });
+
+  test('predominantly elevated HR still prevents a long-gap join', () {
+    final data = recording(gapHrAt: (s) => s % 60 < 40 ? 90 : 60);
+    final result = segmentSleep(data.accel, data.hr, tzOffsetSec: 0);
+    expect(wakeHour(result), closeTo(3, 0.25));
   });
 
   test('stillness with elevated HR does not extend the night', () {

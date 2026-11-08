@@ -893,9 +893,12 @@ bool _withinObservedSleepOpportunity(
   if (flankingHr.length < AdvancedSleepStager.hrRefineMinSamples) return false;
   final baseline = median(flankingHr);
   if (baseline == null) return false;
-  final meanGapHr =
-      paired.fold<double>(0, (sum, ts) => sum + cardiac[ts]!) / paired.length;
-  return meanGapHr <= baseline * AdvancedSleepStager.hrSleepBaselineMult;
+  // Compare the same robust statistic on both sides. A mean gap HR was
+  // sensitive to transient elevations while its flanking baseline was a
+  // median, rejecting a supported restless night by a fraction of one bpm.
+  final gapHr = median([for (final ts in paired) cardiac[ts]!]);
+  return gapHr != null &&
+      gapHr <= baseline * AdvancedSleepStager.hrSleepBaselineMult;
 }
 
 List<_SleepGroup> _bridgeAdjacentSessions(
